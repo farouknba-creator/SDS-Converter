@@ -30,4 +30,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sds-rebrander-exe
-          path: dist/sds_converter_rebrand.exe
+          path: dist/sds_converter_rebrand_noai.exe
