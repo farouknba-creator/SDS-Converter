@@ -24,7 +24,7 @@ jobs:
 
       - name: Build standalone exe
         run: |
-          pyinstaller --onefile --console --add-data "template.docx;." --add-data "company_info.json;." sds_converter_rebrand.py
+          pyinstaller --onefile --console --add-data "template.docx;." sds_converter_rebrand.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
