@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,10 +25,10 @@ jobs:
 
       - name: Build standalone exe
         run: |
-          pyinstaller --onefile --console --add-data "template.docx;." sds_converter_rebrand_noai.py
+          pyinstaller --onefile --console --add-data "template.docx;." sds_converter_rebrandnoai.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: sds-rebrander-exe
-          path: dist/sds_converter_rebrand_noai.exe
+          path: dist/sds_converter_rebrandnoai.exe
