@@ -1,23 +1,57 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
+import json
 import os
 import sys
-import re
-import tempfile
-from pdf2docx import Converter
+import requests
 from docx import Document
-from docx.shared import Pt
+import pdfplumber   # better table/text extraction than PyPDF2
 
 # -------------------------------------------------------------------
-# Your company details (customise once)
+# CONFIGURATION
 # -------------------------------------------------------------------
-COMPANY_NAME = "Your Company Name"
-COMPANY_ADDRESS = "123 Chemical Lane, Industrial City"
-COMPANY_PHONE = "+1 555 123 4567"
-COMPANY_WEBSITE = "www.yourcompany.com"
+DEEPSEEK_API_KEY = ""   # paste your key, or leave blank to be prompted
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+MODEL = "deepseek-chat"
 
 # -------------------------------------------------------------------
-# Helper for PyInstaller bundled resources
+# The extraction prompt – edit this JSON structure to match your template
+# -------------------------------------------------------------------
+EXTRACTION_PROMPT = """
+You are a chemical safety expert. Extract the following information from the SDS text below.
+Return ONLY a valid JSON object with these exact keys (use empty string or empty list if not found):
+
+{
+  "product_name": "...",
+  "supplier_name": "...",
+  "supplier_code": "...",
+  "cas_numbers": ["...", "..."],
+  "hazard_statements": ["H...", "..."],
+  "composition": "...",
+  "first_aid_measures": "...",
+  "fire_fighting": "...",
+  "accidental_release": "...",
+  "handling_storage": "...",
+  "exposure_controls": "...",
+  "physical_chemical": "...",
+  "stability_reactivity": "...",
+  "toxicological": "...",
+  "ecological": "...",
+  "disposal": "...",
+  "transport": "...",
+  "regulatory": "...",
+  "other": "..."
+}
+
+SDS text:
+---
+{sds_text}
+---
+JSON:
+"""
+
+# -------------------------------------------------------------------
+# Helpers
 # -------------------------------------------------------------------
 def resource_path(relative_path):
     try:
@@ -26,217 +60,156 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# -------------------------------------------------------------------
-# PDF to DOCX conversion (keeps formatting)
-# -------------------------------------------------------------------
-def pdf_to_docx(pdf_path, docx_path):
-    cv = Converter(pdf_path)
-    cv.convert(docx_path, start=0, end=None)
-    cv.close()
-    return docx_path
+def load_mapping():
+    map_path = resource_path("mapping.json")
+    if not os.path.exists(map_path):
+        return {}
+    with open(map_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# -------------------------------------------------------------------
-# Remove old supplier sections from the DOCX body
-# -------------------------------------------------------------------
-def delete_supplier_section(doc):
-    """Delete all paragraphs and tables from the start of the document
-    up to the first safety heading (after Section 1)."""
-    
-    # Headings that mark the end of Section 1 (supplier identification)
-    stop_patterns = [
-        r'\bSECTION\s*2\b',
-        r'\bHAZARDS?\s*IDENTIFICATION\b',
-        r'\bCOMPOSITION\s*\/?\s*INFORMATION\s+ON\s+INGREDIENTS\b',
-        r'2\.\s+HAZARDS?\s*IDENTIFICATION',
-        r'2\.\s+COMPOSITION'
-    ]
-    
-    # Gather all block-level elements in order
-    body = doc.element.body
-    elements_to_delete = []
-    stop = False
-    
-    for child in body:
-        if stop:
-            break
-        # Check if child is a paragraph or table
-        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-        if tag in ('p', 'tbl'):
-            # Get text of this element (for paragraphs)
-            text = ''
-            if tag == 'p':
-                # Extract text from paragraph
-                text = child.text or ''
-                for r in child.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-                    if r.text:
-                        text += r.text
-            else:
-                # For tables, we can't easily get text in one line; we'll use the whole table's text later
-                # Better to check the table's first row or just include tables in stop detection via paragraphs inside
-                # We'll check the first paragraph inside the table for simplicity
-                para = child.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p')
-                if para is not None:
-                    text = para.text or ''
-                    for r in para.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-                        if r.text:
-                            text += r.text
-            
-            # Check if text matches a stop pattern
-            for pat in stop_patterns:
-                if re.search(pat, text, re.IGNORECASE):
-                    stop = True
-                    break
-            
-            if not stop:
-                elements_to_delete.append(child)
-    
-    # Remove the identified elements
-    for elem in elements_to_delete:
-        body.remove(elem)
+def extract_text_from_pdf(pdf_path):
+    """Use pdfplumber for better extraction (handles tables well)."""
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text.strip()
 
-# -------------------------------------------------------------------
-# Clean old headers/footers that appear as repeating text in body
-# -------------------------------------------------------------------
-def strip_repeating_header_lines(doc, supplier_names):
-    """Remove paragraphs that look like per-page headers/footers containing
-    supplier details, page numbers, or web addresses."""
-    removal_pattern = re.compile(
-        r'(Page\s+\d+\s+of\s+\d+|' +
-        '|'.join(re.escape(name) for name in supplier_names) +
-        r'|www\.|http|Tel|Fax|Phone|Emergency\s*Tel)',
-        re.IGNORECASE
-    )
+def call_deepseek(prompt, api_key):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a precise JSON-only extractor. Never include explanations."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 3000
+    }
+    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+def extract_structured_data(sds_text, api_key):
+    prompt = EXTRACTION_PROMPT.format(sds_text=sds_text)
+    raw = call_deepseek(prompt, api_key)
+    # Clean possible markdown fences
+    raw = raw.strip().removeprefix("```json").removeprefix("```").rstrip("```").strip()
+    return json.loads(raw)
+
+def map_internal_code(data, mapping):
+    supplier = data.get("supplier_name", "")
+    code = data.get("supplier_code", "")
+    internal = mapping.get(supplier) or mapping.get(code) or code
+    data["internal_code"] = internal
+    return data
+
+def fill_template(data, output_path):
+    template_path = resource_path("template.docx")
+    if not os.path.exists(template_path):
+        raise FileNotFoundError("template.docx not found")
+
+    doc = Document(template_path)
+
+    # Replace in paragraphs
     for para in doc.paragraphs:
-        if removal_pattern.search(para.text):
-            # Remove the paragraph element completely
-            p = para._element
-            p.getparent().remove(p)
-    # Also check tables (rarely used for headers)
+        for key, value in data.items():
+            placeholder = f"{{{{{key}}}}}"
+            if placeholder in para.text:
+                if isinstance(value, list):
+                    value = ", ".join(value)
+                if para.text.strip() == placeholder:
+                    # If the placeholder is the whole paragraph, keep the style
+                    para.clear()
+                    para.add_run(str(value))
+                else:
+                    para.text = para.text.replace(placeholder, str(value))
+
+    # Replace in tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for para in cell.paragraphs:
-                    if removal_pattern.search(para.text):
-                        p = para._element
-                        p.getparent().remove(p)
+                    for key, value in data.items():
+                        placeholder = f"{{{{{key}}}}}"
+                        if placeholder in para.text:
+                            if isinstance(value, list):
+                                value = ", ".join(value)
+                            if para.text.strip() == placeholder:
+                                para.clear()
+                                para.add_run(str(value))
+                            else:
+                                para.text = para.text.replace(placeholder, str(value))
+
+    doc.save(output_path)
 
 # -------------------------------------------------------------------
-# Replace product name in the remaining body
-# -------------------------------------------------------------------
-def replace_product_name(doc, new_name):
-    """Find 'Product name' or 'Product identifier' and change the next run
-    or the same paragraph to the new name."""
-    patterns = [
-        r'(Product\s*name\s*:?\s*)',
-        r'(Product\s*identifier\s*:?\s*)',
-        r'(1\.1\s*Product\s*identifier\s*)'
-    ]
-    for para in doc.paragraphs:
-        for pat in patterns:
-            match = re.search(pat, para.text, re.IGNORECASE)
-            if match:
-                # We'll replace the whole paragraph text with "Product name: new_name"
-                para.text = match.group(1) + new_name
-                return
-
-# -------------------------------------------------------------------
-# Apply your company header/footer to all sections
-# -------------------------------------------------------------------
-def apply_company_header_footer(doc):
-    for section in doc.sections:
-        # Header
-        header = section.header
-        header.is_linked_to_previous = False
-        header.paragraphs[0].clear()
-        run = header.paragraphs[0].add_run(f"{COMPANY_NAME} – {COMPANY_ADDRESS} – {COMPANY_PHONE}")
-        run.font.size = Pt(9)
-        # Footer
-        footer = section.footer
-        footer.is_linked_to_previous = False
-        footer.paragraphs[0].clear()
-        run = footer.paragraphs[0].add_run(f"Confidential – {COMPANY_WEBSITE}")
-        run.font.size = Pt(8)
-
-# -------------------------------------------------------------------
-# Main processing pipeline
-# -------------------------------------------------------------------
-def process_sds(pdf_path, output_path, product_name=None, progress_callback=None):
-    if not product_name:
-        product_name = os.path.splitext(os.path.basename(pdf_path))[0]
-
-    # Temp file for intermediate DOCX
-    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
-        temp_docx = tmp.name
-
-    try:
-        if progress_callback: progress_callback("Converting PDF to DOCX (preserving formatting)...")
-        pdf_to_docx(pdf_path, temp_docx)
-
-        if progress_callback: progress_callback("Removing supplier identification...")
-        doc = Document(temp_docx)
-        
-        # Delete Section 1 (supplier block)
-        delete_supplier_section(doc)
-        
-        # Remove repeating header/footer lines (common supplier names)
-        supplier_names = [
-            "Sigma-Aldrich", "Fisher Scientific", "Merck", "BASF", "Dow", "DuPont",
-            "Thermo Fisher", "VWR", "Avantor", "Acros Organics"
-        ]  # extend as needed
-        strip_repeating_header_lines(doc, supplier_names)
-        
-        # Replace product name
-        replace_product_name(doc, product_name)
-        
-        # Apply your company header/footer
-        apply_company_header_footer(doc)
-
-        if progress_callback: progress_callback("Saving final document...")
-        doc.save(output_path)
-
-    finally:
-        # Clean up temp file
-        if os.path.exists(temp_docx):
-            os.unlink(temp_docx)
-
-    return product_name
-
-# -------------------------------------------------------------------
-# GUI (same as before, but with preview showing DOCX conversion note)
+# GUI
 # -------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SDS Rebrander (Format-Preserving)")
-        self.geometry("650x550")
+        self.title("SDS Converter – Field Mapping")
+        self.geometry("600x500")
         self.resizable(True, True)
+        self.api_key = DEEPSEEK_API_KEY
+
+        if not self.api_key:
+            self.show_api_key_prompt()
+        else:
+            self.build_main_ui()
+
+    def show_api_key_prompt(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+        tk.Label(self, text="Enter your DeepSeek API key:", font=("Arial", 12)).pack(pady=20)
+        self.api_entry = tk.Entry(self, width=50, show="*")
+        self.api_entry.pack(pady=5)
+        tk.Button(self, text="Save & Continue", command=self.save_api_key).pack(pady=10)
+
+    def save_api_key(self):
+        key = self.api_entry.get().strip()
+        if not key:
+            messagebox.showerror("Error", "API key cannot be empty.")
+            return
+        self.api_key = key
+        for widget in self.winfo_children():
+            widget.destroy()
         self.build_main_ui()
 
     def build_main_ui(self):
-        tk.Label(self, text="SDS Rebrander", font=("Arial", 16, "bold")).pack(pady=10)
-        tk.Label(self, text="Supplier details are removed, formatting is kept.\n"
-                           "Product name is replaced, company header/footer added.",
+        tk.Label(self, text="SDS Converter", font=("Arial", 16, "bold")).pack(pady=10)
+        tk.Label(self, text="Extracts standard fields and fills your company template.\n"
+                           "All formatting is from the template, not the source.",
                  wraplength=500, justify="left").pack(pady=5)
 
+        # File selection
         frame = tk.Frame(self)
         frame.pack(pady=5)
         self.file_label = tk.Label(frame, text="No PDF selected", fg="gray", width=45, anchor="w")
         self.file_label.pack(side="left", padx=5)
         tk.Button(frame, text="Choose PDF...", command=self.select_pdf).pack(side="left")
 
+        # Product name override (optional)
         name_frame = tk.Frame(self)
         name_frame.pack(pady=5)
-        tk.Label(name_frame, text="Product name (blank = use filename):").pack(side="left")
+        tk.Label(name_frame, text="Product name (blank = extract from PDF):").pack(side="left")
         self.product_name_var = tk.StringVar()
         tk.Entry(name_frame, textvariable=self.product_name_var, width=30).pack(side="left", padx=5)
 
+        # Convert button
         self.convert_btn = tk.Button(self, text="Convert", state="disabled", command=self.convert)
         self.convert_btn.pack(pady=10)
 
         self.status = tk.Label(self, text="", fg="blue")
         self.status.pack(pady=5)
 
-        # Preview area (shows first bit of converted text for diagnostics)
+        # Preview area
         tk.Label(self, text="Extracted text preview (first 2000 chars):", anchor="w").pack(pady=(10,0))
         self.preview = scrolledtext.ScrolledText(self, height=10, width=70, state="disabled")
         self.preview.pack(padx=10, pady=5)
@@ -249,46 +222,62 @@ class App(tk.Tk):
             self.pdf_path = path
             self.file_label.config(text=os.path.basename(path))
             self.convert_btn.config(state="normal")
-            base = os.path.splitext(os.path.basename(path))[0]
-            self.product_name_var.set(base)
-            # Quick preview using old PyPDF2 text extraction (just for diagnostics)
+            # Preview
             try:
-                from PyPDF2 import PdfReader
-                reader = PdfReader(path)
-                text = ""
-                for page in reader.pages[:2]:  # first two pages
-                    t = page.extract_text()
-                    if t: text += t + "\n"
+                raw = extract_text_from_pdf(path)
                 self.preview.config(state="normal")
                 self.preview.delete(1.0, tk.END)
-                if text.strip():
-                    self.preview.insert(tk.END, text[:2000])
+                if raw:
+                    self.preview.insert(tk.END, raw[:2000])
                 else:
-                    self.preview.insert(tk.END, "⚠️ Scanned PDF detected. Conversion will still work (using layout), but text may be limited.")
+                    self.preview.insert(tk.END, "⚠️ No text found – PDF may be scanned.")
                 self.preview.config(state="disabled")
-            except Exception:
-                pass
+            except Exception as e:
+                self.preview.config(state="normal")
+                self.preview.delete(1.0, tk.END)
+                self.preview.insert(tk.END, f"Error: {e}")
+                self.preview.config(state="disabled")
 
     def convert(self):
         if not self.pdf_path:
             return
         output_path = filedialog.asksaveasfilename(defaultextension=".docx",
                                                    filetypes=[("Word Document", "*.docx")],
-                                                   initialfile=self.product_name_var.get() + ".docx")
+                                                   initialfile=os.path.splitext(os.path.basename(self.pdf_path))[0] + "_converted.docx")
         if not output_path:
             return
+
         self.convert_btn.config(state="disabled")
-        self.status.config(text="Working...")
+        self.status.config(text="Extracting text...")
         self.update()
 
         try:
-            product_name = self.product_name_var.get().strip() or None
-            process_sds(self.pdf_path, output_path, product_name,
-                        progress_callback=lambda msg: self.status.config(text=msg))
+            raw_text = extract_text_from_pdf(self.pdf_path)
+            if not raw_text:
+                raise ValueError("No text extracted – scanned PDF? Try OCR first.")
+
+            self.status.config(text="Calling DeepSeek to extract fields...")
+            self.update()
+            data = extract_structured_data(raw_text, self.api_key)
+
+            # Override product name if provided
+            manual_name = self.product_name_var.get().strip()
+            if manual_name:
+                data["product_name"] = manual_name
+
+            # Map internal code
+            mapping = load_mapping()
+            data = map_internal_code(data, mapping)
+
+            self.status.config(text="Filling template...")
+            self.update()
+            fill_template(data, output_path)
+
             self.status.config(text=f"Done! Saved to {output_path}")
-            messagebox.showinfo("Success", f"Formatted file saved to:\n{output_path}")
+            messagebox.showinfo("Success", f"Document saved to:\n{output_path}")
+
         except Exception as e:
-            messagebox.showerror("Error", f"Conversion failed:\n{str(e)}")
+            messagebox.showerror("Error", str(e))
             self.status.config(text="Error occurred.")
         finally:
             self.convert_btn.config(state="normal")
