@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, scrolledtext
 import os
 import sys
 import re
@@ -9,10 +9,10 @@ from docx import Document
 # -------------------------------------------------------------------
 # Your permanent company details
 # -------------------------------------------------------------------
-COMPANY_NAME = "TAQA Well Solutions"
-COMPANY_ADDRESS = "2nd Industrial City, Dammam 32241, Saudi Arabia"
-COMPANY_PHONE = "+966 13 328 8288"
-COMPANY_WEBSITE = "www.tq.com"
+COMPANY_NAME = "Your Company Name"
+COMPANY_ADDRESS = "123 Chemical Lane, Industrial City"
+COMPANY_PHONE = "+1 555 123 4567"
+COMPANY_WEBSITE = "www.yourcompany.com"
 LOGO_PATH = None   # embed logo in template.docx
 
 # -------------------------------------------------------------------
@@ -26,48 +26,61 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # -------------------------------------------------------------------
-# Rule-based supplier removal (FREE, OFFLINE)
+# Safer supplier block removal – NEVER deletes everything
 # -------------------------------------------------------------------
 def strip_supplier_section(text):
     """
-    Remove supplier identification block by cutting from the start of the document
-    to the end of SECTION 1 (and any content before SECTION 2).
-    Keeps the rest of the SDS intact.
+    Remove supplier identification block from the top of the SDS.
+    Strategy:
+    - Find the first significant safety heading (like "HAZARDS IDENTIFICATION"
+      or "COMPOSITION") and keep everything from that point onward.
+    - Also try to delete common supplier name lines if they appear before that.
+    - If no heading is found, return the original text unchanged (better safe).
     """
-    # Normalise line endings and case for regex
     cleaned = text.strip()
-    
-    # Find the start of SECTION 2 (everything after is safety data we want to keep)
-    # We'll keep everything from SECTION 2 onward, plus any product name that may appear
-    # before SECTION 1. But most of the time we just want from SECTION 2 to end.
-    
-    # Pattern: "SECTION 2:" or "Section 2:" or "2." style headings
-    match_section2 = re.search(
-        r'(SECTION\s*2\s*:|Section\s*2\s*:|2\.\s*HAZARDS\s*IDENTIFICATION)',
-        cleaned,
-        re.IGNORECASE
-    )
-    
-    if match_section2:
-        # Keep text from the start of SECTION 2 to the end
-        body = cleaned[match_section2.start():]
-    else:
-        # Fallback: if we can't find Section 2, try to remove the first block
-        # that looks like an address (multiple lines with postal codes, phone, etc.)
-        lines = cleaned.split('\n')
-        start_keeping = 0
-        for i, line in enumerate(lines):
-            if re.search(r'(SECTION\s*2|HAZARDS\s*IDENTIFICATION|COMPOSITION)', line, re.I):
-                start_keeping = i
-                break
-        body = '\n'.join(lines[start_keeping:]) if start_keeping else cleaned
+    if not cleaned:
+        return cleaned
 
-    # Remove any remaining supplier name/logo lines that might be at the top
-    # (e.g., a company name line before Section 1)
-    body = re.sub(r'^.*(Sigma[-\s]?Aldrich|Fisher|Merck|BASF|Dow|DuPont).*\n?', '', body, flags=re.I)
-    
+    # List of section headings that indicate the start of the main SDS body
+    # (case‑insensitive, whole words)
+    safety_headings = [
+        r'\bHAZARDS?\s*IDENTIFICATION\b',
+        r'\bCOMPOSITION\s*\/?\s*INFORMATION\s+ON\s+INGREDIENTS\b',
+        r'\bFIRST\s*AID\s+MEASURES\b',
+        r'\bTOXICOLOGICAL\s+INFORMATION\b',
+        r'\bSECTION\s*2\b',                     # GHS style "SECTION 2:"
+        r'\b2\.?\s+HAZARDS\s*IDENTIFICATION\b'  # "2. Hazards Identification"
+    ]
+
+    # Find the earliest occurrence of any safety heading
+    earliest = len(cleaned)
+    for pattern in safety_headings:
+        match = re.search(pattern, cleaned, re.IGNORECASE)
+        if match and match.start() < earliest:
+            earliest = match.start()
+
+    if earliest < len(cleaned):
+        # Keep everything from the safety heading onward
+        body = cleaned[earliest:].strip()
+    else:
+        # No safety heading found – keep all text (don't destroy it)
+        body = cleaned
+
+    # Remove any remaining supplier name lines at the very top (just in case)
+    # These are typical well‑known chemical suppliers. Extend with your own.
+    supplier_patterns = [
+        r'^.*(Sigma[-\s]?Aldrich|Fisher\s*Scientific|Merck\s*KGaA|BASF\s*SE|Dow\s*Chemical|DuPont|Thermo\s*Fisher).*\n?',
+        r'^.*(www\.|http).*\n?',            # web addresses
+        r'^.*(Tel|Phone|Fax|Emergency).*\n?'
+    ]
+    for pat in supplier_patterns:
+        body = re.sub(pat, '', body, flags=re.IGNORECASE | re.MULTILINE)
+
     return body.strip()
 
+# -------------------------------------------------------------------
+# PDF text extraction
+# -------------------------------------------------------------------
 def extract_text_from_pdf(pdf_path):
     reader = PdfReader(pdf_path)
     text = ""
@@ -75,8 +88,11 @@ def extract_text_from_pdf(pdf_path):
         page_text = page.extract_text()
         if page_text:
             text += page_text + "\n"
-    return text
+    return text.strip()
 
+# -------------------------------------------------------------------
+# Template filling
+# -------------------------------------------------------------------
 def fill_template(product_name, sds_body, output_path):
     template_path = resource_path("template.docx")
     if not os.path.exists(template_path):
@@ -108,6 +124,9 @@ def fill_template(product_name, sds_body, output_path):
 
     doc.save(output_path)
 
+# -------------------------------------------------------------------
+# Main processing
+# -------------------------------------------------------------------
 def process_sds(pdf_path, output_path, product_name=None, progress_callback=None):
     if not product_name:
         product_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -115,47 +134,71 @@ def process_sds(pdf_path, output_path, product_name=None, progress_callback=None
     if progress_callback: progress_callback("Extracting text from PDF...")
     raw_text = extract_text_from_pdf(pdf_path)
 
-    if progress_callback: progress_callback("Removing supplier details (rule-based)...")
+    # Save raw text for debugging (sidecar file)
+    txt_path = output_path.replace('.docx', '_raw_text.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(raw_text)
+
+    if not raw_text:
+        raise ValueError(
+            "No text could be extracted from this PDF.\n\n"
+            "The PDF is likely a scanned image (no digital text layer).\n"
+            "A raw text file (empty) was saved next to the output for inspection."
+        )
+
+    if progress_callback: progress_callback("Removing supplier details...")
     cleaned = strip_supplier_section(raw_text)
+
+    if not cleaned:
+        # This should never happen with the new strip function, but just in case
+        cleaned = raw_text  # fallback to original
 
     if progress_callback: progress_callback("Generating Word document...")
     fill_template(product_name, cleaned, output_path)
     return product_name
 
 # -------------------------------------------------------------------
-# GUI (unchanged from before, minus API key prompts)
+# GUI with diagnostic text box
 # -------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SDS Rebrander (Free)")
-        self.geometry("550x350")
-        self.resizable(False, False)
+        self.geometry("650x550")
+        self.resizable(True, True)
         self.build_main_ui()
 
     def build_main_ui(self):
-        tk.Label(self, text="SDS Rebrander (Free)", font=("Arial", 16, "bold")).pack(pady=10)
-        tk.Label(self, text="Convert any Safety Data Sheet to your company format.\n"
-                           "Supplier details are automatically removed.",
-                 wraplength=450, justify="left").pack(pady=5)
+        tk.Label(self, text="SDS Rebrander", font=("Arial", 16, "bold")).pack(pady=10)
+        tk.Label(self, text="Supplier details are automatically removed.\n"
+                           "Extracted text preview below (for diagnostics).",
+                 wraplength=500, justify="left").pack(pady=5)
 
+        # File selection
         frame = tk.Frame(self)
         frame.pack(pady=5)
         self.file_label = tk.Label(frame, text="No PDF selected", fg="gray", width=45, anchor="w")
         self.file_label.pack(side="left", padx=5)
         tk.Button(frame, text="Choose PDF...", command=self.select_pdf).pack(side="left")
 
+        # Product name
         name_frame = tk.Frame(self)
         name_frame.pack(pady=5)
         tk.Label(name_frame, text="Product name (blank = use filename):").pack(side="left")
         self.product_name_var = tk.StringVar()
         tk.Entry(name_frame, textvariable=self.product_name_var, width=30).pack(side="left", padx=5)
 
+        # Convert button
         self.convert_btn = tk.Button(self, text="Convert", state="disabled", command=self.convert)
         self.convert_btn.pack(pady=10)
 
         self.status = tk.Label(self, text="", fg="blue")
         self.status.pack(pady=5)
+
+        # Diagnostic text area
+        tk.Label(self, text="Extracted text preview (first 2000 chars):", anchor="w").pack(pady=(10,0))
+        self.preview = scrolledtext.ScrolledText(self, height=10, width=70, state="disabled")
+        self.preview.pack(padx=10, pady=5)
 
         self.pdf_path = None
 
@@ -167,6 +210,21 @@ class App(tk.Tk):
             self.convert_btn.config(state="normal")
             base = os.path.splitext(os.path.basename(path))[0]
             self.product_name_var.set(base)
+            # Show a quick preview of raw extracted text
+            try:
+                raw = extract_text_from_pdf(path)
+                self.preview.config(state="normal")
+                self.preview.delete(1.0, tk.END)
+                if raw:
+                    self.preview.insert(tk.END, raw[:2000] + ("..." if len(raw) > 2000 else ""))
+                else:
+                    self.preview.insert(tk.END, "⚠️ WARNING: No extractable text! This PDF is probably scanned.")
+                self.preview.config(state="disabled")
+            except Exception as e:
+                self.preview.config(state="normal")
+                self.preview.delete(1.0, tk.END)
+                self.preview.insert(tk.END, f"Error reading PDF: {e}")
+                self.preview.config(state="disabled")
 
     def convert(self):
         if not self.pdf_path:
