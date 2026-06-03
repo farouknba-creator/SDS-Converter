@@ -1,3 +1,0 @@
-      - name: Build standalone exe
-        run: |
-          pyinstaller --onefile --console --add-data "template.docx;." --add-data "mapping.json;." sds_converter_final.py
